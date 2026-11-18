@@ -37,6 +37,8 @@ measured, every fee modeled, and the results reported — even when they're ugly
 | `polbot tape-wallets` | mines cached trade tapes for wallet-level win rates — this is how we found the real ≥90% cohort |
 | `polbot top-traders` | pulls the Polymarket leaderboard and profiles the top wallets' 5m-market activity |
 | `polbot/fairvalue.py` | gap→probability model with **basis noise calibrated from 299 real windows** (Binance direction matches Chainlink settlement only 87.6% of the time) |
+| **`polbot mm-*` (v2 engine)** | multi-market maker engine (`polbot/mm/`): BTC+ETH+SOL simultaneously, TWAP-blend endgame model, edge-weighted Kelly ladder, ohanism-style dominance skew, fee-regime model (pre/post Nov 20 2026), Chainlink-settlement-feed option, paper executor on live books |
+| `polbot mm-backtest` | 1s-bar backtester for the v2 engine with band-level win-rate tables (calibration validator) |
 | risk layer | per-market caps, daily-loss halt, toxicity guard (pauses a side after N one-sided fills), stale-data halt, error-storm kill |
 
 ## Test results (all reproducible)
@@ -56,8 +58,16 @@ sample; it drops to 0.05 for BTC 5m on Nov 20 2026). Makers pay 0.
 | `sniper` (lead-lag taker, 1s data) | 30.4% | **−$2,607** | −$8.72 | −$59 | $2,892 | 868 |
 | `harvester` (late-window favorites, strict) | 83.3% | **−$6.66** | −$0.02 | −$8.61 | $8.61 | 11 |
 | `harvester` (relaxed gates) | 81.2% | −$35.66 | −$0.12 | −$50 | $50 | 60 |
+| **`mm` v2 (default: edge-weighted, ¼-Kelly, 3× dominance skew)** | 35.4% | **−$2,538** | −$8.49 | −$107 | $2,703 | 4,581 |
+| `mm` v2 (very-tight: 6¢ edge, 5% Kelly, $60 cap) | 34.8% | −$1,563 | −$5.23 | — | — | 3,379 |
+| `mm` v2 (harvest-lean: strong-side only, 10¢ edge) | 32.0% | −$1,007 | −$3.37 | — | — | 2,448 |
 
-Cross-asset check (118 SOL windows): legacy −$11.70/window, fv −$4.32/window. Same story.
+Cross-asset check (118 SOL windows): legacy −$11.70/window, fv −$4.32/window,
+mm v2 −$13.08/window. Same story: Binance-anchored maker ladders bleed;
+tightening converges toward the harvester (−$0.02/window, 80–83% win rate).
+
+Full report including the band-level win-rate table (where the ≥90% win rate
+actually lives): [BACKTEST.md](BACKTEST.md).
 
 **Why the ladder loses** — adverse selection, exactly as the on-chain data
 predicts: your resting bids fill precisely when informed flow blasts through
@@ -160,6 +170,12 @@ windows.**
    Binance, is the only configuration with a plausible live edge. Even then:
    expect ~90% win rate on far fewer entries than the pros get, thin margins,
    and the occasional basis-flip loss eating ten wins.
+2b. The v2 engine (`polbot mm-run`, paper default) is the production platform
+   for exactly that upgrade: set `data.spot_source: chainlink` in
+   `mm-config.yaml` and the fair-value model anchors on the settlement oracle
+   itself (the 4.6bps basis term zeroes out). Default ladder sizing stays
+   conservative; the real-tape sweep above shows why aggressive sizing just
+   amplifies adverse selection.
 3. If you ever go live: small caps (`--max-cost`), the daily-loss halt on, and
    never funds you need for rent.
 
@@ -172,12 +188,19 @@ python scripts/run_tick_backtest.py --asset btc --strategies harvester --fv-min 
 python scripts/sniper_calibration.py 0.15                    # the calibration table
 python scripts/analyze_tape_wallets.py --asset btc           # the ≥90% cohort
 python scripts/analyze_top_traders.py --top 20               # leaderboard reality
-python -m pytest tests/ -q                                    # 52 tests
+polbot mm-fetch --days 1                                     # 1s klines (3 assets)
+polbot mm-backtest --days 1 --out results/mm/bars_edge_1d    # band win-rate table
+polbot mm-test                                               # data-plane connectivity
+polbot mm-run                                                # paper-run the v2 engine
+python -m pytest tests/ -q                                    # 70 tests
 ```
 
 Docs: [docs/RESEARCH.md](docs/RESEARCH.md) (mechanics, API surface),
 [research/INTEL.md](research/INTEL.md) (the full intelligence file: fees,
-leaderboard studies, the manipulation paper, wallet mining, strategy notes).
+leaderboard studies, the manipulation paper, wallet mining, strategy notes),
+[docs/RESEARCH_V2.md](docs/RESEARCH_V2.md) (v2 dossier: whale autopsies —
+SirMartingale, ohanism — fee formula, TWAP settlement, live book measurements),
+[BACKTEST.md](BACKTEST.md) (the full validation report).
 
 ## Disclaimer
 

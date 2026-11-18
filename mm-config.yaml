@@ -1,0 +1,75 @@
+# polbot default configuration — every knob the bot uses.
+# Secrets are NEVER stored here: use environment variables (.env.example).
+
+mode: paper                 # paper | live
+bankroll: 1000.0            # starting bankroll used for sizing (USD)
+
+markets:
+  series:
+    - btc-up-or-down-5m
+    - eth-up-or-down-5m
+    - sol-up-or-down-5m
+  quote_pre_open: true      # small symmetric quotes before the window opens
+  pre_open_size_usd: 3.0
+
+quoting:
+  mode: edge_weighted       # edge_weighted (default) | ladder (original 1c-99c flat plan)
+  refresh_interval: 5.0     # cancel/replace cadence (user rule: ~5s)
+  fast_refresh_interval: 2.0
+  fast_refresh_move: 0.03   # fair-value move that triggers the fast cadence
+  low: 0.01
+  high: 0.99
+  min_edge: 0.02            # only bid below (fair - min_edge)
+  min_edge_far: 0.10        # extra edge required in the <=20c tail
+  max_levels_per_side: 25
+  base_size_usd: 3.0        # per-level notional in ladder mode
+  cancel_before_end: 60.0   # user rule: cancel all orders T-60s
+  final_seconds_mode: false # optional: quote 90c+ into the last seconds (research edge)
+  final_seconds_until: 10.0
+  final_seconds_min_price: 0.90
+
+sizing:
+  kelly_fraction: 0.25      # fractional Kelly
+  max_clip_usd: 40.0        # hard per-order cap (whale discipline: bounded clips)
+  max_window_exposure: 120.0
+  dominance_threshold: 0.15 # |fair-0.5| beyond which we skew 3:1 (ohanism bucket)
+  dominance_skew: 3.0
+
+risk:
+  max_total_exposure: 400.0
+  daily_loss_limit: 150.0
+  stale_feed_seconds: 10.0
+  kill_switch_file: KILL    # touch this file to halt the bot
+  min_free_bankroll_frac: 0.25
+
+fees:
+  regime: legacy            # legacy (until 2026-11-20) | tiered (after)
+  taker_rate: 0.07
+  maker_rebate_share: 0.20
+
+execution:
+  post_only: true           # polbot never takes: maker-only, zero fees
+  batch_size: 20
+  poll_interval: 2.0
+  clob_host: https://clob.polymarket.com
+
+data:
+  spot_source: binance    # binance | chainlink (settlement oracle; zeroes the basis term)
+  use_websocket: true
+  rest_poll_interval: 1.0
+  gamma_host: https://gamma-api.polymarket.com
+  history_cache_dir: data/cache
+  binance_symbols:
+    btc-up-or-down-5m: BTCUSDT
+    eth-up-or-down-5m: ETHUSDT
+    sol-up-or-down-5m: SOLUSDT
+
+model:
+  vol_halflife_s: 90
+  min_vol_annual: 0.15
+  max_vol_annual: 3.0
+  twap_seconds: 30          # settlement TWAP window (since 2026-08-07)
+
+logging:
+  level: INFO
+  file: logs/polbot.log

@@ -515,3 +515,179 @@ def run_sniper_window(rec: TradesRecord, series: KlineSeries, tc: TickConfig,
         maker_fills=0, taker_fills=n_fills, fv_final_p_up=0.5,
         edge_taken=edge_sum,
     )
+
+
+# -------------------------------------------------------------- mm (v2) --
+@dataclass
+class MMTickConfig:
+    """v2 engine sizing, replayed on the real tape (see polbot/mm/engine/grid.py)."""
+    min_edge: float = 0.02           # bid only at price <= fair - min_edge
+    min_edge_far: float = 0.10       # extra required edge in the <=20c tail
+    max_quote: float = 0.92
+    min_quote: float = 0.02
+    kelly_fraction: float = 0.25     # fractional Kelly on (fair - price)
+    max_clip_usd: float = 40.0
+    max_window_usd: float = 120.0
+    dominance_threshold: float = 0.15
+    dominance_skew: float = 3.0      # ohanism: >=3x asymmetry = 77.7% WR bucket
+    level_step: float = 0.02
+    bankroll: float = 1000.0
+
+
+def _kelly_frac(q: float, p: float) -> float:
+    if q <= p or p >= 1.0:
+        return 0.0
+    return (q - p) / (1.0 - p)
+
+
+def build_mm_quotes(market: "FiveMinMarket", mmc: MMTickConfig, p_up: float,
+                    spent: float, up_cost: float, dn_cost: float) -> list:
+    """Edge-weighted two-sided ladder with Kelly sizing and dominance skew."""
+    from .grid import Quote
+    tick = 0.01
+    fair = {"Up": p_up, "Down": 1.0 - p_up}
+    budget = mmc.max_window_usd - spent
+    if budget <= 0:
+        return []
+    d = abs(p_up - 0.5)
+    if d < mmc.dominance_threshold:
+        skew = {"Up": 1.0, "Down": 1.0}
+    else:
+        strong = "Up" if p_up > 0.5 else "Down"
+        weak = "Down" if strong == "Up" else "Up"
+        skew = {strong: mmc.dominance_skew, weak: 1.0 / mmc.dominance_skew}
+    wsum = skew["Up"] + skew["Down"]
+
+    quotes: list = []
+    for label in ("Up", "Down"):
+        f = min(max(fair[label], 0.001), 0.999)
+        inv_cost = up_cost if label == "Up" else dn_cost
+        inv_factor = 1.0 / (1.0 + 2.0 * inv_cost / mmc.max_window_usd)
+        side_budget = budget * skew[label] / wsum * inv_factor
+        if side_budget < 1.0:
+            continue
+        spent_side = 0.0
+        # top-down allocation: start at (fair - min_edge), cap per-level size
+        # so deep-tail lottery levels cannot eat the whole budget
+        top = min(f - mmc.min_edge, mmc.max_quote)
+        top = round(int(top / tick + 1e-9) * tick, 6)
+        p = top
+        while p >= mmc.min_quote and spent_side < side_budget:
+            if p <= 0.20:
+                need = mmc.min_edge + mmc.min_edge_far * (0.20 - p) / 0.20
+                level_cap = side_budget * 0.05
+            else:
+                need = mmc.min_edge
+                depth = max(0.0, top - p)
+                level_cap = side_budget * max(0.05, 0.20 * (0.9 ** (depth / 0.10)))
+            edge = f - p
+            if edge >= need:
+                kf = _kelly_frac(f, p) * mmc.kelly_fraction
+                usd = min(mmc.bankroll * kf, mmc.max_clip_usd, level_cap,
+                          side_budget - spent_side)
+                if usd >= 1.0:
+                    shares = max(5.0, float(int(usd / p)))
+                    cost = shares * p
+                    if cost <= side_budget - spent_side:
+                        token = market.up_token if label == "Up" else market.down_token
+                        quotes.append(Quote(token_id=token, label=label,
+                                            price=p, size=shares))
+                        spent_side += cost
+            p = round(p - mmc.level_step, 6)
+
+    # self-cross guard: UP bid + DOWN bid must stay <= 1 - tick
+    up_max = max((q.price for q in quotes if q.label == "Up"), default=None)
+    dn_max = max((q.price for q in quotes if q.label == "Down"), default=None)
+    if up_max is not None and dn_max is not None and up_max + dn_max > 1.0 - tick:
+        excess = up_max + dn_max - (1.0 - tick)
+        for q in quotes:
+            q.price = round(max(mmc.min_quote, q.price - excess / 2), 6)
+    return quotes
+
+
+def run_mm_window(rec: "TradesRecord", series: "KlineSeries", tc: TickConfig,
+                  mmc: MMTickConfig) -> TickResult:
+    """Replay the v2 mm engine's quoting rules on a real trade tape."""
+    trades = rec.parsed()
+    strike = series.strike_at(rec.window_ts * 1000)
+    bt = TickBacktester(None, None, tc)   # for _resting_fills (uses tc.fill_mode)
+    up = SidePosition()
+    dn = SidePosition()
+    resting: dict[str, dict[float, float]] = {"Up": {}, "Down": {}}
+    last_price: dict[str, Optional[float]] = {"Up": None, "Down": None}
+    maker_fills = peak_quotes = 0
+
+    start = rec.window_ts + tc.join_delay_s
+    pull_at = rec.end_ts - tc.pull_before_end_s
+    events: list[tuple[int, str]] = []
+    t = start
+    while t < pull_at:
+        events.append((t, "refresh"))
+        t += tc.refresh_s
+    last_processed_ts = start - 1
+
+    for ev_ts, _kind in events:
+        fills = bt._resting_fills(
+            resting, trades, last_processed_ts, ev_ts,
+            {"Up": "Up", "Down": "Down"})
+        for f in fills:
+            (up if f.label == "Up" else dn).add(f.price, f.shares)
+            maker_fills += 1
+        last_processed_ts = ev_ts
+
+        for tr in trades:
+            if tr.ts <= last_processed_ts:
+                last_price[tr.outcome] = tr.price
+        if last_price.get("Up") is None and last_price.get("Down") is None:
+            continue
+        spot = series.price_at(ev_ts * 1000)
+        if spot is None or strike is None:
+            continue
+        fv = prob_up(spot, strike, series.sigma_until(ev_ts * 1000),
+                     rec.end_ts - ev_ts)
+        quotes = build_mm_quotes_from_fv(rec, mmc, fv.p_up, up.cost + dn.cost,
+                                         up.cost, dn.cost, last_price, trades,
+                                         last_processed_ts)
+        resting = {"Up": {}, "Down": {}}
+        for q in quotes:
+            resting[q.label][q.price] = q.size
+        peak_quotes = max(peak_quotes, len(quotes))
+
+    fills = bt._resting_fills(resting, trades,
+                              last_processed_ts, pull_at,
+                              {"Up": "Up", "Down": "Down"})
+    for f in fills:
+        (up if f.label == "Up" else dn).add(f.price, f.shares)
+        maker_fills += 1
+
+    spent = up.cost + dn.cost
+    win_side = up if rec.winner == "up" else dn
+    pnl = win_side.shares - spent
+    return TickResult(
+        window_ts=rec.window_ts, slug=rec.slug, winner=rec.winner,
+        up_shares=up.shares, down_shares=dn.shares, spent=spent, pnl=pnl,
+        fills=maker_fills, peak_quotes=peak_quotes, hedge_cost=0.0,
+        taker_fees=0.0, maker_fills=maker_fills, taker_fills=0,
+        fv_final_p_up=0.5,
+    )
+
+
+def build_mm_quotes_from_fv(rec, mmc: MMTickConfig, p_up: float, spent: float,
+                            up_cost: float, dn_cost: float,
+                            last_price: dict, trades, last_ts: int) -> list:
+    """build_mm_quotes + post-only guard vs the best observable ask (last trade)."""
+    class _M:  # minimal market adapter
+        pass
+    m = _M()
+    m.up_token, m.down_token = "U", "D"
+    quotes = build_mm_quotes(m, mmc, p_up, spent, up_cost, dn_cost)
+    # drop levels that would cross the observed tape (post-only safety)
+    lp_up = last_price.get("Up")
+    lp_dn = last_price.get("Down")
+    out = []
+    for q in quotes:
+        lp = lp_up if q.label == "Up" else lp_dn
+        if lp is not None and q.price >= lp - 1e-9:
+            continue
+        out.append(q)
+    return out

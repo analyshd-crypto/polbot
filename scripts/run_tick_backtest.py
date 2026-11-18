@@ -19,8 +19,8 @@ from polbot.binance import Kline  # noqa: E402
 from polbot.config import BotConfig  # noqa: E402
 from polbot.fvladder import FVLadderConfig  # noqa: E402
 from polbot.tickbacktest import (  # noqa: E402
-    HarvesterConfig, KlineSeries, TickBacktester, TickConfig,
-    run_harvester_window, run_sniper_window,
+    HarvesterConfig, KlineSeries, MMTickConfig, TickBacktester, TickConfig,
+    run_harvester_window, run_mm_window, run_sniper_window,
 )
 from polbot.tradesdata import load_cached_trades  # noqa: E402
 
@@ -103,6 +103,7 @@ def main() -> None:
     fvc = FVLadderConfig(winrate_mode=args.winrate_mode)
     hc = HarvesterConfig(fv_min=args.fv_min, margin=args.harvest_margin,
                          tleft_start=args.tleft_start)
+    mmc = MMTickConfig()
     all_out = {}
 
     for strat in args.strategies.split(","):
@@ -120,6 +121,8 @@ def main() -> None:
                     r = run_sniper_window(rec, series, tc, cfg)
                 elif strat == "harvester":
                     r = run_harvester_window(rec, series, tc, hc)
+                elif strat == "mm":
+                    r = run_mm_window(rec, series, tc, mmc)
                 else:
                     r = bt.run_window(rec, series)
                 results.append(r)

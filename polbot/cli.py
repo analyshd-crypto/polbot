@@ -324,6 +324,154 @@ def cmd_tape_wallets(args: argparse.Namespace) -> int:
                             "--min-windows", str(args.min_windows)])
 
 
+# ---------------------------------------------------------------- mm engine --
+def _mm_config(path: str):
+    from .mm.config import Config
+    cfg = Config.load(path or "mm-config.yaml")
+    return cfg
+
+
+def _mm_logging(cfg) -> None:
+    os.makedirs(os.path.dirname(cfg.logging.file) or ".", exist_ok=True)
+    fmt = "%(asctime)s %(levelname)-7s %(name)s | %(message)s"
+    logging.basicConfig(level=getattr(logging, cfg.logging.level.upper(), logging.INFO),
+                        format=fmt, force=False,
+                        handlers=[logging.StreamHandler(),
+                                  logging.FileHandler(cfg.logging.file)])
+
+
+def cmd_mm_run(args: argparse.Namespace) -> int:
+    """Run the v2 multi-market maker engine (paper by default)."""
+    cfg = _mm_config(args.config)
+    if args.bankroll:
+        cfg.bankroll = args.bankroll
+    if args.mode:
+        cfg.mode = args.mode
+    _mm_logging(cfg)
+    from .mm.bot import PolBot
+    if cfg.mode == "live":
+        unlock = os.environ.get("POLBOT_LIVE_UNLOCK", "")
+        if unlock != "I-UNDERSTAND-THE-RISK":
+            print("live mode requires POLBOT_LIVE_UNLOCK=I-UNDERSTAND-THE-RISK")
+            return 2
+    bot = PolBot(cfg)
+    bot.run()
+    return 0
+
+
+def cmd_mm_test(args: argparse.Namespace) -> int:
+    """Connectivity test for the mm engine's data plane."""
+    import time as _t
+    from .mm.data.binance import SpotFeed, fetch_klines
+    from .mm.data.clob import ClobPublic
+    from .mm.data.gamma import GammaClient
+    cfg = _mm_config(args.config)
+    print("== polbot mm engine connection test ==")
+    g = GammaClient(cfg.data.gamma_host)
+    wins = g.fetch_windows(cfg.markets.series[0], limit=5)
+    print(f"[OK] gamma: {len(wins)} {cfg.markets.series[0]} windows; "
+          f"next: {wins[0].event_slug if wins else '-'}")
+    c = ClobPublic(cfg.execution.clob_host)
+    if wins:
+        bb, ba = c.best_bid_ask(wins[0].tokens[0])
+        print(f"[OK] clob book: best_bid={bb} best_ask={ba}")
+    k = fetch_klines("BTCUSDT", "1s", limit=2)
+    print(f"[OK] binance klines: last close={float(k[-1][4]):.2f}")
+    feed = SpotFeed(["BTCUSDT"], use_websocket=cfg.data.use_websocket)
+    feed.start()
+    _t.sleep(4.0)
+    px = feed.last("BTCUSDT")
+    src = "ws" if feed._ws_ok else "rest-fallback"
+    print(f"[OK] spot feed ({src}): BTCUSDT={px}")
+    feed.stop()
+    print("all good.")
+    return 0
+
+
+def cmd_mm_fetch(args: argparse.Namespace) -> int:
+    from .mm.data.binance import fetch_klines
+    cfg = _mm_config(args.config)
+    outdir = args.out or cfg.data.history_cache_dir
+    os.makedirs(outdir, exist_ok=True)
+    symbols = args.symbols.split(",") if args.symbols else \
+        list(cfg.data.binance_symbols.values())
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(args.days * 86400 * 1000)
+    for sym in symbols:
+        path = os.path.join(outdir, f"{sym}_{args.interval}_{args.days}d.csv")
+        rows = fetch_klines(sym, args.interval, start_ms=start_ms, end_ms=now_ms)
+        with open(path, "w") as f:
+            f.write("ts,open,high,low,close,volume\n")
+            for r in rows:
+                f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]}\n")
+        print(f"[OK] {sym}: {len(rows)} bars -> {path}")
+    return 0
+
+
+def _mm_load_bars(cfg, args):
+    from .mm.backtest.engine import Bar
+    outdir = args.cache or cfg.data.history_cache_dir
+    bars = {}
+    for sym in (args.symbols.split(",") if args.symbols
+                else list(cfg.data.binance_symbols.values())):
+        path = os.path.join(outdir, f"{sym}_{args.interval}_{args.days}d.csv")
+        if not os.path.exists(path):
+            raise SystemExit(f"missing cached history: {path} (run mm-fetch first)")
+        out = []
+        with open(path) as f:
+            next(f)
+            for line in f:
+                ts, o, h, l, c, v = line.strip().split(",")
+                out.append(Bar(float(ts) / 1000.0, float(o), float(h),
+                               float(l), float(c)))
+        bars[sym] = out
+        print(f"[OK] loaded {len(out)} bars for {sym}")
+    return bars
+
+
+def cmd_mm_backtest(args: argparse.Namespace) -> int:
+    from .mm.backtest.engine import BacktestEngine, BacktestParams
+    from .mm.backtest import report
+    cfg = _mm_config(args.config)
+    if args.mode:
+        cfg.quoting.mode = args.mode
+    bars = _mm_load_bars(cfg, args)
+    params = BacktestParams(
+        lag_seconds=args.lag, trade_through_ticks=args.trade_through,
+        queue_fill_fraction=args.queue_frac, noise_ticks=args.noise)
+    eng = BacktestEngine(cfg, bars, params)
+    t0 = time.time()
+    res = eng.run()
+    dt = time.time() - t0
+    out = args.out or os.path.join("results", "mm",
+                                   f"{cfg.quoting.mode}_{int(time.time())}")
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    report.save(res, out, f"polbot mm backtest — {cfg.quoting.mode}",
+                {"data": f"{args.days}d {args.interval} bars, "
+                         f"{sum(len(v) for v in bars.values())} bars total",
+                 "config": f"mode={cfg.quoting.mode} bankroll={cfg.bankroll} "
+                           f"max_window={cfg.sizing.max_window_exposure}"})
+    print(json.dumps(res.summary(), indent=1))
+    print("bands:", json.dumps(res.band_table(), indent=1))
+    print(f"ran in {dt:.1f}s -> {out}.md / .json")
+    return 0
+
+
+def cmd_mm_whales(args: argparse.Namespace) -> int:
+    import urllib.request
+    url = "https://data-api.polymarket.com/v2/leaderboard?window=30d&limit=20"
+    req = urllib.request.Request(url, headers={"User-Agent": "polbot/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode())
+    rows = data.get("leaderboard") or data.get("data") or data
+    print("top traders by 30d PnL:")
+    for row in rows[:20]:
+        print(f"  #{row.get('rank')}: {row.get('user_name') or (row.get('user_id') or '')[:10]} "
+              f"pnl=${row.get('pnl', 0):,.0f} volume=${row.get('volume', 0):,.0f} "
+              f"roi={(row.get('pnl', 0) / max(row.get('volume', 1), 1)) * 100:.0f}%")
+    return 0
+
+
 # --------------------------------------------------------------------- main --
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -405,6 +553,45 @@ def build_parser() -> argparse.ArgumentParser:
     ptw.add_argument("--asset", choices=SUPPORTED_ASSETS, default="btc")
     ptw.add_argument("--min-windows", type=int, default=25)
     ptw.set_defaults(func=cmd_tape_wallets)
+
+    # ---- v2 mm engine ----
+    pmr = sub.add_parser("mm-run",
+                         help="run the v2 multi-market maker engine "
+                              "(paper by default; live needs POLBOT_MODE=live + unlock)")
+    pmr.add_argument("--config", default="mm-config.yaml")
+    pmr.add_argument("--mode", choices=("paper", "live"), default=None)
+    pmr.add_argument("--bankroll", type=float, default=None)
+    pmr.set_defaults(func=cmd_mm_run)
+
+    pmt = sub.add_parser("mm-test", help="mm engine connectivity test")
+    pmt.add_argument("--config", default="mm-config.yaml")
+    pmt.set_defaults(func=cmd_mm_test)
+
+    pmf = sub.add_parser("mm-fetch", help="cache 1s Binance klines for mm backtests")
+    pmf.add_argument("--config", default="mm-config.yaml")
+    pmf.add_argument("--days", type=float, default=2.0)
+    pmf.add_argument("--interval", default="1s")
+    pmf.add_argument("--symbols", default=None)
+    pmf.add_argument("--out", default=None)
+    pmf.set_defaults(func=cmd_mm_fetch)
+
+    pmb = sub.add_parser("mm-backtest",
+                         help="backtest the mm engine on cached 1s bars")
+    pmb.add_argument("--config", default="mm-config.yaml")
+    pmb.add_argument("--days", type=float, default=2.0)
+    pmb.add_argument("--interval", default="1s")
+    pmb.add_argument("--symbols", default=None)
+    pmb.add_argument("--cache", default=None)
+    pmb.add_argument("--mode", default=None, choices=("edge_weighted", "ladder"))
+    pmb.add_argument("--lag", type=float, default=3.0)
+    pmb.add_argument("--trade-through", type=int, default=1)
+    pmb.add_argument("--queue-frac", type=float, default=0.6)
+    pmb.add_argument("--noise", type=float, default=0.0)
+    pmb.add_argument("--out", default=None)
+    pmb.set_defaults(func=cmd_mm_backtest)
+
+    pmw = sub.add_parser("mm-whales", help="30d leaderboard snapshot (data-api v2)")
+    pmw.set_defaults(func=cmd_mm_whales)
 
     return p
 

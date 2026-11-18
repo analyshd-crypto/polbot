@@ -28,3 +28,6 @@ data/cache/
 
 # tick-backtest data cache (300MB+; refetch with scripts/fetch_tick_data.py)
 data/
+
+# runtime logs (fills.jsonl is kept as paper-session receipts)
+logs/*.log
