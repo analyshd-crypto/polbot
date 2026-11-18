@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "polbot"
-version = "0.1.0"
+version = "1.0.0"
 description = "Market-making bot for Polymarket 5-minute crypto Up/Down markets: two-sided limit-order ladder, refresh-and-repost, pull before close, hold to resolution."
 readme = "README.md"
 license = { text = "MIT" }

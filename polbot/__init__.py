@@ -22,6 +22,6 @@ fills against live books (dry-run), and a live backend places real orders
 through the official ``polymarket-client`` SDK.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = ["__version__"]

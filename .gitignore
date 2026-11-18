@@ -18,8 +18,13 @@ venv/
 .ruff_cache/
 
 # data caches and backtest outputs (not source)
+data/trades/
+data/binance/
 data/cache/
-results/
+# results are committed: they are the receipts
 
 # os
 .DS_Store
+
+# tick-backtest data cache (300MB+; refetch with scripts/fetch_tick_data.py)
+data/

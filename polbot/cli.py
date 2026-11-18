@@ -113,21 +113,36 @@ def cmd_run(args: argparse.Namespace) -> int:
     clock = RealClock()
     data = LiveMarketData(cfg, http=_http(cfg), clock=clock)
 
+    # v1 strategy layer: fv (fair-value anchored ladder) or legacy (v0 full ladder)
+    fvc = None
+    fv_feed = None
+    if args.strategy in ("fv", "fv_hedge"):
+        from .engine import FairValueFeed
+        from .fvladder import FVLadderConfig
+
+        fvc = FVLadderConfig(endgame_hedge=(args.strategy == "fv_hedge"))
+        fv_feed = FairValueFeed(cfg, http=_http(cfg))
+
     if cfg.dry_run:
         backend = PaperBackend(fill_ratio=cfg.paper_fill_ratio)
-        print(f"[polbot] DRY-RUN (paper) | {cfg.describe()}")
+        print(f"[polbot] DRY-RUN (paper) | strategy={args.strategy} | {cfg.describe()}")
     else:
         pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
         wallet = os.environ.get("POLYMARKET_WALLET") or None
         if not pk:
             print("live mode requires POLYMARKET_PRIVATE_KEY (see .env.example)")
             return 2
+        unlock = os.environ.get("POLBOT_LIVE_UNLOCK", "")
+        if unlock != "I-UNDERSTAND-THE-RISK":
+            print("live mode requires POLBOT_LIVE_UNLOCK=I-UNDERSTAND-THE-RISK in .env")
+            print("paper mode is the default for a reason: see README 'Honest results'")
+            return 2
         backend = LiveBackend(cfg, pk, wallet, clock=clock)
-        print(f"[polbot] LIVE TRADING | {cfg.describe()}")
+        print(f"[polbot] LIVE TRADING | strategy={args.strategy} | {cfg.describe()}")
 
     risk = RiskManager(cfg)
     stats = RunStats()
-    engine = Engine(cfg, data, backend, clock, risk, stats)
+    engine = Engine(cfg, data, backend, clock, risk, stats, fvc=fvc, fv_feed=fv_feed)
 
     async def _run() -> None:
         try:
@@ -266,6 +281,49 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+# ----------------------------------------------------------- tick-backtest --
+def cmd_tick_backtest(args: argparse.Namespace) -> int:
+    """Delegates to scripts/run_tick_backtest.py logic (kept in sync)."""
+    script = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                          "scripts", "run_tick_backtest.py")
+    if not os.path.exists(script):  # installed package fallback
+        print("tick backtest requires the repo checkout (scripts/ directory)")
+        return 1
+    import subprocess
+
+    argv = [sys.executable, script, "--asset", args.asset,
+            "--strategies", args.strategies,
+            "--fee-rate", str(args.fee_rate),
+            "--edge-min", str(args.edge_min),
+            "--fv-min", str(args.fv_min)]
+    if args.json_out:
+        argv += ["--json-out", args.json_out]
+    return subprocess.call(argv)
+
+
+def cmd_top_traders(args: argparse.Namespace) -> int:
+    script = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                          "scripts", "analyze_top_traders.py")
+    if not os.path.exists(script):
+        print("requires the repo checkout (scripts/ directory)")
+        return 1
+    import subprocess
+
+    return subprocess.call([sys.executable, script, "--top", str(args.top)])
+
+
+def cmd_tape_wallets(args: argparse.Namespace) -> int:
+    script = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                          "scripts", "analyze_tape_wallets.py")
+    if not os.path.exists(script):
+        print("requires the repo checkout (scripts/ directory)")
+        return 1
+    import subprocess
+
+    return subprocess.call([sys.executable, script, "--asset", args.asset,
+                            "--min-windows", str(args.min_windows)])
+
+
 # --------------------------------------------------------------------- main --
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -284,6 +342,10 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--asset", choices=SUPPORTED_ASSETS, default="btc")
     pr.add_argument("--live", action="store_true",
                     help="place REAL orders (requires credentials)")
+    pr.add_argument("--strategy", default="legacy",
+                    choices=("legacy", "fv", "fv_hedge"),
+                    help="legacy = v0 full ladder; fv = fair-value anchored "
+                         "ladder; fv_hedge = fv + endgame flatten")
     pr.add_argument("--max-windows", type=int, default=None)
     pr.add_argument("--size-per-level", type=float, default=None)
     pr.add_argument("--refresh", type=float, default=None,
@@ -318,6 +380,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     pd = sub.add_parser("doctor", help="check connectivity and credentials")
     pd.set_defaults(func=cmd_doctor)
+
+    ptb = sub.add_parser("tick-backtest",
+                         help="tick-level backtest over real trade tapes "
+                              "(see scripts/fetch_tick_data.py first)")
+    ptb.add_argument("--asset", choices=SUPPORTED_ASSETS, default="btc")
+    ptb.add_argument("--strategies", default="legacy,fv,fv_hedge,harvester,sniper")
+    ptb.add_argument("--fee-rate", type=float, default=0.05,
+                     help="crypto taker fee coefficient (0.05 for BTC 5m from "
+                          "2026-11-20; 0.07 before)")
+    ptb.add_argument("--edge-min", type=float, default=0.15)
+    ptb.add_argument("--fv-min", type=float, default=0.965)
+    ptb.add_argument("--json-out", default="")
+    ptb.set_defaults(func=cmd_tick_backtest)
+
+    ptt = sub.add_parser("top-traders",
+                         help="analyze Polymarket leaderboard wallets on 5m markets")
+    ptt.add_argument("--top", type=int, default=20)
+    ptt.set_defaults(func=cmd_top_traders)
+
+    ptw = sub.add_parser("tape-wallets",
+                         help="mine cached trade tapes for wallet win rates "
+                              "(finds the real >=90%% cohort)")
+    ptw.add_argument("--asset", choices=SUPPORTED_ASSETS, default="btc")
+    ptw.add_argument("--min-windows", type=int, default=25)
+    ptw.set_defaults(func=cmd_tape_wallets)
 
     return p
 

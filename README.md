@@ -1,223 +1,186 @@
 # polbot
 
-**A market-making bot for Polymarket's 5-minute crypto Up/Down markets (BTC / ETH / SOL / XRP) — a faithful, tested, open-source implementation of the "ladder" bot described in the viral X post and demo video.**
+**A research-grade trading bot + honest backtester for Polymarket's 5-minute crypto
+Up/Down markets (BTC / ETH / SOL / XRP).**
 
-> Every 5 minutes a new market opens: *will BTC be up or down at the close?*
-> The bot rests BUY limit orders on **both** outcome books at every cent
-> below the current price, cancels and reposts every ~5 seconds, pulls
-> everything about a minute before the close, and holds whatever it bought
-> to resolution. It never sells.
+Born from the viral "$810/day ladder bot" X post and demo video, rebuilt the way it
+should be: every claim tested against **real trade-tape data**, every strategy
+measured, every fee modeled, and the results reported — even when they're ugly.
 
-- Paper mode by default (live data, simulated fills, zero risk)
-- Real-order mode through the **official `polymarket-client` SDK** with post-only orders, GTD expiries, client-side rate limiting and a kill switch
-- Event-driven **backtester over real resolved windows** fetched from Polymarket's own APIs
-- 29 unit/integration tests, CI on Python 3.10–3.12
+> **Read this first — the honest summary**
+>
+> We implemented the viral strategy exactly (two-sided 1¢–99¢ ladder, 5-second
+> reposts, pull at T−60s, hold to settlement) and backtested it on **299 real BTC
+> windows (405,828 actual trades, tick-level fills, conservative trade-through
+> fill model)**: it **loses $3,135** (−$10.49/window, 36% win rate).
+> The refined fair-value ladder loses 43% less. The late-window "favorite
+> harvester" — the strategy the real ≥90%-win-rate wallets use — is the only
+> structure that comes close to break-even at our data quality, and it wins
+> 76–83% of windows, not 90%+.
+>
+> **Win rate ≥ 90% is real on these markets** — we found 168 of 1,272 active
+> wallets doing it — but their edge is thin (+~2%/window on capital) and runs on
+> information advantages (Chainlink settlement feed, order-flow, latency) that a
+> Binance-anchored bot cannot fully replicate. Anyone promising you a bot with a
+> guaranteed 90% win rate *and* fat profits is selling a story. The numbers
+> below are the receipts.
 
 ---
 
-## Read this first: our own test results (honest)
+## What's in the box
 
-We built this bot, tested it, and measured it. **The mechanics work exactly as described — but the profitability claim does not reproduce on historical data.** Numbers below are real, reproducible with the commands shown.
+| piece | what it does |
+|---|---|
+| `polbot run` | live engine: market discovery, two-sided quoting, 5s cancel/repost, pull at T−60s, endgame hedge, kill switches. Paper mode by default; live requires an explicit unlock env var. |
+| `polbot backtest` | v0 backtester on 1-minute price history (fast, coarse) |
+| `polbot tick-backtest` + `scripts/` | **tick-level backtester**: replays every actual trade + 1-second Binance klines, conservative fill model, taker fees, harvester/sniper/ladder strategies |
+| `polbot tape-wallets` | mines cached trade tapes for wallet-level win rates — this is how we found the real ≥90% cohort |
+| `polbot top-traders` | pulls the Polymarket leaderboard and profiles the top wallets' 5m-market activity |
+| `polbot/fairvalue.py` | gap→probability model with **basis noise calibrated from 299 real windows** (Binance direction matches Chainlink settlement only 87.6% of the time) |
+| risk layer | per-market caps, daily-loss halt, toxicity guard (pauses a side after N one-sided fills), stale-data halt, error-storm kill |
 
-### Live dry-run (paper fills against live books, 5-second polling)
+## Test results (all reproducible)
 
-| window | asset | fills | capital committed | paper PnL |
-|---|---|---|---|---|
-| #1795005000 | BTC | 98 | $249.90 / $250 | **+210.10** |
-| #1795006800 | ETH | 103 | $249.95 / $250 | **+135.05** |
+### 1. Tick-level backtest — 299 BTC windows, Nov 17–18 2026 (405,828 trades)
 
-Both windows happened to be violent two-way whipsaws — the strategy's best
-case. They prove the machinery (quoting, fills, pull, settlement) works, not
-that it is profitable on average.
+Fill model: resting bids fill **only on trade-through** (a real trade prints
+strictly below the bid). Taker legs fill at the next real trade price, capped by
+demonstrated liquidity ×0.5. Taker fee coefficient 0.07 (the rate during the
+sample; it drops to 0.05 for BTC 5m on Nov 20 2026). Makers pay 0.
 
-### Backtest over real resolved windows (1-minute price history, real outcomes)
-
-Default parameters (full 1¢–99¢ ladder, 5 shares/level, $250 budget, pull at T-60s, optimistic 100% fill per sweep):
-
-| asset | windows | win rate | total PnL | avg/window | worst window | max DD |
+| strategy | win rate | total PnL | avg/window | worst | max DD | fills |
 |---|---|---|---|---|---|---|
-| BTC | 300 | 20.5% | **-6,064** | -20.2 | -141.3 | 6,089 |
-| ETH | 149 | 24.2% | **-2,220** | -14.9 | -160.3 | 2,517 |
-| SOL | 150 | 22.1% | **-2,720** | -18.1 | -133.0 | 2,843 |
+| `legacy` (the viral ladder, exactly) | 36.4% | **−$3,135** | −$10.49 | −$120 | $3,444 | 18,150 |
+| `fv` (fair-value anchored ladder) | 33.8% | **−$1,925** | −$6.44 | −$105 | $1,999 | 8,327 |
+| `fv_hedge` (+ endgame flatten) | 34.4% | **−$1,780** | −$5.95 | −$105 | $1,853 | 8,413 |
+| `sniper` (lead-lag taker, 1s data) | 30.4% | **−$2,607** | −$8.72 | −$59 | $2,892 | 868 |
+| `harvester` (late-window favorites, strict) | 83.3% | **−$6.66** | −$0.02 | −$8.61 | $8.61 | 11 |
+| `harvester` (relaxed gates) | 81.2% | −$35.66 | −$0.12 | −$50 | $50 | 60 |
 
-Halving simulated fills (queue-position discount) roughly halves the losses — it does not flip the sign.
+Cross-asset check (118 SOL windows): legacy −$11.70/window, fv −$4.32/window. Same story.
 
-### Parameter variants (BTC, 300 windows)
+**Why the ladder loses** — adverse selection, exactly as the on-chain data
+predicts: your resting bids fill precisely when informed flow blasts through
+them. You buy the losing side all the way down. The Telonex wallet study
+(46,945 wallets) found the single biggest loser on 15m crypto markets was a
+majority-maker wallet at **−$140K/week**.
 
-| variant | win rate | total PnL |
-|---|---|---|
-| baseline (1¢–99¢ ladder) | 20.5% | -6,064 |
-| only expensive levels (≥50¢) | 50.3% | -1,572 |
-| ≥30¢ | 26.2% | -4,017 |
-| pull at T-120s | 24.9% | -4,171 |
-| ≥50¢ + pull at T-120s | 47.8% | **-655** |
+**Why the sniper loses at 1-second data** — fill-level calibration shows the
+model claims P(win) = 28.6% / 39.6% / 54.1% by price bucket while reality is
+3.6% / 11.6% / 26.6%: **the Polymarket tape leads a 1s Binance signal.** The
+professional snipers run on the Chainlink stream and sub-second feeds; that
+edge is a latency arms race, not a backtestable free lunch.
 
-### Interpretation — why the viral claims and this backtest disagree
+**Why the harvester is the closest** — it replicates what the ≥90% cohort
+actually does (see below), but with Binance-only information the entries it can
+identify are ~break-even. The cohort's edge comes from better inputs.
 
-1. **Adverse selection is real and big.** These markets trend hard within
-   their 5-minute life. When price sweeps down through your ladder you are
-   systematically buying the losing side. 237 of 300 BTC windows lost.
-2. **The claimed profit engine is invisible to historical data.** Polymarket
-   only serves price history at 1-minute granularity (we probed: bucket
-   minimum is 60s). The video's profits come from intra-minute wicks —
-   panic sweeps that bounce within seconds. A 1-minute backtest sees the
-   endpoint of each minute, missing both the fill and the recovery.
-   Only a live paper run (or WebSocket recording) can measure that.
-3. **Queue position is not modelled.** Your resting bid sits behind other
-   makers at the same price; real fill rates are lower than simulated.
-4. **Maker rebates are not modelled** (20% of taker fees on crypto markets,
-   paid daily to makers — note: Polymarket changes rebates to volume tiers
-   on Nov 20, 2026). They help, but not by enough to flip the numbers above.
-5. **Selection bias.** The "$810/day" screenshot is one account over an
-   unknown period; losing market makers rarely go viral.
+### 2. The ≥90% win-rate cohort (found by mining our 299-window tape)
 
-**Bottom line:** treat this as a well-engineered research tool, not a money
-printer. If you run it live, run it small, watch it constantly, and expect
-the risk limits to trigger.
+`python scripts/analyze_tape_wallets.py` ranks every wallet in the tape:
 
----
+- **168 of 1,272 active wallets (13%) win ≥90% of their windows**
+- Best: 134/134 windows won (+$390, $35K volume); largest PnL: 92.1% win rate,
+  +$1,705 over 140 windows ($93K volume)
+- Their fingerprint: **buy the near-certain side at 95–99¢ (avg 93.8¢) in the
+  final ~2 minutes, one side only, never sell, hold to settlement**, sized
+  $50–$1,200 per order
+- Economics: ~+2% per window on deployed capital — thin, positive, and
+  information-hungry (they read the Chainlink feed and the tape; 21% of their
+  entries come in the last 60 seconds, where basis flips live)
+- The all-time-PnL leaderboard does NOT play this game: 19 of the top 20
+  wallets have zero 5m-market activity; the one that does is **−$5,602** on it
 
-## The strategy, precisely
+### 3. Basis calibration (the quiet killer)
 
-For each 5-minute window (windows align to unix timestamps divisible by 300):
+Binance end-of-window direction matches the Chainlink-settled outcome in only
+**87.6%** of windows. Flip rate by |gap|: <0.02% → 32% flips; 0.05–0.1% → 8.8%;
+0.1–0.2% → 2.6%; >0.2% → 0/40. Fitted basis sigma ≈ **4.6 bps**. This is why
+"buying the 97¢ sure thing" on a Binance signal is a trap, and why
+`polbot/fairvalue.py` carries the basis term. (Live, use the SDK's
+`crypto_prices_chainlink` stream — it's the settlement source itself.)
 
-1. **Discover** the market deterministically: slug `{asset}-updown-5m-{window_ts}` via the Gamma API; each market has two outcome tokens (Up / Down) with independent order books.
-2. **Ladder**: place BUY orders at every tick from 1¢ up to just below the current best ask, on **both** books. Two safety invariants:
-   - never bid at/above the ask (would cross and pay taker fees);
-   - never let `up_bid + down_bid > 1 - tick` — your own bids can otherwise match *each other* and mint $1 of collateral for more than $1 (instant loss).
-3. **Refresh**: cancel all market orders and repost the ladder every `POLBOT_REFRESH_S` seconds (default 5) so it tracks the mid.
-4. **Pull**: cancel everything `POLBOT_PULL_S` seconds (default 60) before the window closes.
-5. **Hold to resolution**: winners pay $1/share (Chainlink Data Streams resolution); losers pay $0. The bot never sells.
+### 4. Fees and rebates (as of Nov 18 2026 — changing Nov 20!)
 
-Money is supposed to come from (a) buying the likely winner at 90¢+ when
-panickers sweep it down (steady 1.5–5% discounts) and (b) buying the
-temporarily-crashed side for pennies when it recovers (20–30x payoffs).
-Losses come from trending windows where the crashed side never recovers.
-
-### Fees: makers pay zero
-
-Crypto markets on Polymarket charge **takers only**:
-`fee = shares × 0.07 × p × (1 − p)` (e.g. $0.07 per share at 1¢ or 99¢,
-$1.75 per 100 shares at 50¢). **Makers are never charged** and receive 20%
-rebates of taker fees. Since this bot only posts resting post-only BUYs, it
-always trades as maker. (Fee schedule changes were announced for Nov 20,
-2026 — re-check with `polbot status`.)
-
----
-
-## Install
-
-```bash
-git clone https://github.com/analyshd-crypto/polbot.git
-cd polbot
-pip install -e ".[dev]"      # or: pip install -e . && pip install pytest
-pytest -m "not live" -q      # 29 tests should pass
-```
-
-Python 3.10+. The read/paper/backtest paths use only the standard library;
-`polymarket-client` is required only for live orders.
-
-## Usage
-
-```bash
-# Live market snapshot: books, tick, fees (no auth)
-polbot status --asset btc
-
-# Paper trading against live books (default, no credentials needed)
-polbot run --asset btc                    # runs forever, Ctrl-C to stop
-polbot run --asset btc --max-windows 1    # one window
-
-# Backtest on real resolved windows (cached under data/cache)
-polbot backtest --asset btc --windows 300 --out results/btc.csv
-polbot backtest --asset eth              # replay whatever is cached
-polbot backtest --asset btc --fill-ratio 0.5        # conservative fills
-POLBOT_MIN_PRICE=0.50 polbot backtest --asset btc   # expensive-only variant
-
-# Live trading (requires .env — see examples/live_setup.md)
-polbot doctor                             # verify credentials
-polbot run --live --asset btc --max-windows 1
-polbot cancel-all                         # KILL SWITCH: cancel all orders
-```
-
-Key runtime knobs (env or CLI, see `.env.example`):
-
-| env | default | meaning |
-|---|---|---|
-| `POLBOT_ASSET` | btc | btc / eth / sol / xrp |
-| `POLBOT_SIZE_PER_LEVEL` | 5 | shares per ladder level (CLOB min 5) |
-| `POLBOT_MIN_PRICE` / `POLBOT_MAX_PRICE` | 0.01 / 0.99 | ladder price range |
-| `POLBOT_REFRESH_S` | 5 | cancel & repost cadence |
-| `POLBOT_PULL_S` | 60 | pull orders N s before close |
-| `POLBOT_MAX_COST` | 250 | max spend per market (fills + resting) |
-| `POLBOT_MAX_SHARES_SIDE` | 500 | per-side inventory cap |
-| `POLBOT_DAILY_LOSS` | 250 | halt after realized loss |
-| `POLBOT_PAPER_FILL_RATIO` | 1.0 | paper fill fraction per sweep (queue modelling) |
-| `POLBOT_DRY_RUN` | 1 | 1 = paper (default), 0 = live |
-| `POLYMARKET_PRIVATE_KEY` | — | live orders only |
-| `POLYMARKET_WALLET` | — | funder/proxy wallet (if applicable) |
+- Crypto taker fee: `fee = shares × rate × p × (1−p)`; rate 0.07 now, **0.05 for
+  BTC 5m/15m from Nov 20 2026 23:59 UTC**. Makers always pay 0.
+- Maker rebates move from daily pools to volume tiers: **0% under $200K 30-day
+  maker weighted volume**, 15% at $10M+. A small maker now earns nothing back —
+  the passive spread game is structurally worse from Nov 20.
+- The academic literature (arXiv 2606.31675) attributes the famous "$8.2M edge"
+  on 5-minute BTC markets to **settlement-time spot manipulation** (821
+  suspected wallets pushing Binance price in the final 10 seconds). We do not
+  implement that; the bot deliberately stops quoting before that window.
 
 ## Architecture
 
 ```
-polbot/
-├── config.py     # BotConfig dataclass + env loading + validation
-├── clock.py      # real / simulated clocks (backtests run in milliseconds)
-├── net.py        # stdlib HTTP with retries (no auth needed for reads)
-├── markets.py    # window math, deterministic slugs, event parsing, outcomes
-├── clob.py       # order books, price history, fee rates (public CLOB REST)
-├── grid.py       # ladder builder: cross-spread + self-cross guards, budget
-├── pnl.py        # fills -> positions -> settlement; run statistics
-├── risk.py       # budget/inventory caps, daily-loss halt, error backoff
-├── ratelimit.py  # client-side token buckets mirroring CLOB per-signer limits
-├── backends.py   # PaperBackend (sim fills) / LiveBackend (official SDK)
-├── engine.py     # per-window state machine: quote -> refresh -> pull -> settle
-├── data.py       # fetch + cache real resolved windows for backtests
-├── backtest.py   # event-driven replay through the unchanged engine
-└── cli.py        # status / run / backtest / cancel-all / doctor
+gamma-api ── market discovery (slug = {asset}-updown-5m-{window_ts})
+clob-api  ── books / prices / (SDK SecureClient: post-only GTD orders)
+data-api  ── trade tapes (cursor-paginated), leaderboard, wallet stats
+binance   ── 1s klines / bookTicker (fair-value leg)
+   │
+   ▼
+FairValueFeed (gap → probability, basis-corrected)
+   ▼
+strategy: legacy ladder | FV ladder (+toxicity guard) | endgame hedge | harvester | sniper
+   ▼
+ExecutionBackend: Paper (sim fills vs live books) | Live (polymarket-client SDK)
+   ▼
+RiskManager (caps, daily-loss halt, error-storm kill) + RunStats (the dashboard)
 ```
 
-The engine is identical in live, paper and backtest modes — only the
-execution backend and clock differ. Backtests therefore exercise the real
-strategy code, not a reimplementation.
+## Quick start
 
-### Rate-limit safety
+```bash
+pip install -e .            # or: pip install -r requirements.txt
 
-Polymarket enforces per-signer token buckets (Standard tier: 40 order
-tokens/s, burst 60; 80 cancel tokens/s, burst 120; a batch of N orders
-costs N tokens; cancel-market costs 1 + orders canceled). polbot mirrors
-those buckets client-side, splits ladders into chunks of 40, and paces
-itself — a full ~99-order refresh every 5s stays within Standard tier.
+polbot status               # live market snapshot, no auth needed
+polbot backtest --asset btc --windows 200       # v0 backtest (1-min data)
+python scripts/fetch_tick_data.py --asset btc --windows 300
+polbot tick-backtest --asset btc --strategies legacy,fv,fv_hedge,harvester,sniper
+polbot tape-wallets --asset btc                 # find the ≥90% cohort yourself
 
-## Risks — read before going live
+polbot run --asset btc --strategy fv_hedge       # PAPER mode vs live books
+polbot run --asset btc --strategy legacy --live  # real orders; needs .env unlock
+polbot cancel-all                              # kill switch
+polbot doctor                                  # connectivity + credentials check
+```
 
-- **This strategy lost money in every backtest we ran** (see tables above).
-  The viral profit claims could not be reproduced from historical data.
-- A single window can consume the entire `POLBOT_MAX_COST` budget.
-- 5-minute markets are extremely competitive; other market makers with
-  lower latency and better queue position are on the same books.
-- Polymarket fee/rebate schedules change (next change announced for
-  2026-11-20); tick size flips from 0.01 to 0.001 near price extremes.
-- Geo-restrictions: you must be allowed to use Polymarket where you live.
-- Software risk: order rejection, API changes, network failures. The bot
-  backs off and halts after `POLBOT_DAILY_LOSS` or repeated errors, and
-  GTD expiries ensure a crashed bot leaves no resting orders.
-- **Nothing here is financial advice. Use at your own risk.**
+`.env` (see `.env.example`): `POLYMARKET_PRIVATE_KEY` for live mode, plus the
+explicit `POLBOT_LIVE_UNLOCK=I-UNDERSTAND-THE-RISK` safety. **Start in paper
+mode. Stay in paper mode until a strategy has survived hundreds of paper
+windows.**
 
-## Roadmap ideas
+## What we would actually run (and what not to)
 
-- WebSocket user-channel fills (instead of trade polling)
-- Delta-repost (only cancel/replace changed levels) to cut rate-limit usage
-- Inventory skew (widen the side you're heavy on)
-- Maker-rebate accounting in PnL
-- Multi-window/multi-asset concurrency (currently one asset, one window)
+1. **Don't run the legacy ladder.** It's implemented for completeness and
+   falsification; the data says it bleeds.
+2. The `harvester` in **paper mode**, fed by the Chainlink stream instead of
+   Binance, is the only configuration with a plausible live edge. Even then:
+   expect ~90% win rate on far fewer entries than the pros get, thin margins,
+   and the occasional basis-flip loss eating ten wins.
+3. If you ever go live: small caps (`--max-cost`), the daily-loss halt on, and
+   never funds you need for rent.
 
-## Research notes
+## Reproducing everything
 
-See [docs/RESEARCH.md](docs/RESEARCH.md) for the full intelligence report:
-how the markets resolve (Chainlink Data Streams), API mechanics, fee
-schedule, tick-size dynamics, the demo-video teardown, and the complete
-backtest methodology with all results.
+```bash
+python scripts/fetch_tick_data.py --asset btc --windows 300   # ~10 min, ~320MB
+python scripts/run_tick_backtest.py --asset btc --strategies legacy,fv,fv_hedge
+python scripts/run_tick_backtest.py --asset btc --strategies harvester --fv-min 0.95
+python scripts/sniper_calibration.py 0.15                    # the calibration table
+python scripts/analyze_tape_wallets.py --asset btc           # the ≥90% cohort
+python scripts/analyze_top_traders.py --top 20               # leaderboard reality
+python -m pytest tests/ -q                                    # 52 tests
+```
 
-## License
+Docs: [docs/RESEARCH.md](docs/RESEARCH.md) (mechanics, API surface),
+[research/INTEL.md](research/INTEL.md) (the full intelligence file: fees,
+leaderboard studies, the manipulation paper, wallet mining, strategy notes).
 
-MIT — see [LICENSE](LICENSE).
+## Disclaimer
+
+This software is for research and education. Prediction-market trading is
+risky; 63% of wallets on these markets lose money (median ≈ −$3/week). Nothing
+here is financial advice. The maintainers are not affiliated with Polymarket.

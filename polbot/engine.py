@@ -5,12 +5,17 @@ demonstrated bot:
 
     quoting  ->  refresh every cfg.refresh_interval_s (cancel + repost ladder)
              ->  pulled  at end_ts - cfg.pull_before_end_s
-             ->  resolved once the outcome is known (hold to resolution; never sell)
+             ->  (v1) endgame hedge window: flatten via the opposite side
+             ->  resolved once the outcome is known (hold to resolution)
 
 The engine is execution-agnostic: it drives an
 :class:`polbot.backends.ExecutionBackend` (paper for dry-run / backtest,
 live for real orders) and reads market state from a
 :class:`MarketData` provider (live REST or replayed history).
+
+v1 adds an optional fair-value anchor: a :class:`FairValueFeed` supplies
+spot/strike/sigma and the ladder is anchored on the model probability
+(:mod:`polbot.fvladder`) instead of blindly quoting every cent.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ from typing import Optional
 from .clock import Clock
 from .clob import Book
 from .config import BotConfig
+from .fairvalue import FairValue, prob_up
+from .fvladder import FVLadderConfig, ToxicityMonitor, build_fv_ladder, endgame_hedge
 from .grid import build_ladder
 from .markets import FiveMinMarket, fetch_market, fetch_outcome, next_window_start, window_start
 from .net import HttpClient
@@ -94,17 +101,54 @@ class LiveMarketData(MarketData):
             await asyncio.sleep(3.0)
 
 
+class FairValueFeed:
+    """Supplies the model fair value for the live engine.
+
+    Strike ("price to beat"): the first Binance spot print observed at/after
+    the window open. In live trading the Chainlink stream (SDK
+    ``crypto_prices_chainlink``) is the settlement source and should be
+    preferred; Binance is the fallback anchor and always the vol source.
+    """
+
+    def __init__(self, cfg: BotConfig, http: Optional[HttpClient] = None,
+                 binance_url: str = "https://api.binance.com") -> None:
+        from .binance import BinanceFeed
+
+        self.cfg = cfg
+        self.http = http or HttpClient(timeout=10.0)
+        self.feed = BinanceFeed(self.http, binance_url, cfg.asset)
+        self._strike: Optional[float] = None
+        self._strike_window: Optional[int] = None
+
+    def fair_value(self, market: FiveMinMarket, now: float) -> FairValue:
+        self.feed.refresh(now)
+        spot = self.feed.spot()
+        if self._strike_window != market.window_ts:
+            # reset the strike for a new window
+            self._strike = None
+            self._strike_window = market.window_ts
+        if self._strike is None and spot is not None:
+            self._strike = spot  # first print of the window (approximation)
+        t_left = market.end_ts - now
+        return prob_up(spot, self._strike, self.feed.sigma(), t_left)
+
+
 # ------------------------------------------------------------------ engine --
 class Engine:
     def __init__(self, cfg: BotConfig, data: MarketData, backend, clock: Clock,
                  risk: Optional[RiskManager] = None,
-                 stats: Optional[RunStats] = None) -> None:
+                 stats: Optional[RunStats] = None,
+                 fvc: Optional[FVLadderConfig] = None,
+                 fv_feed: Optional["FairValueFeed"] = None) -> None:
         self.cfg = cfg
         self.data = data
         self.backend = backend
         self.clock = clock
         self.risk = risk or RiskManager(cfg)
         self.stats = stats or RunStats()
+        # v1 strategy layer: None => legacy v0 ladder (quote every cent)
+        self.fvc = fvc
+        self.fv_feed = fv_feed
 
     # ------------------------------------------------------------- public --
     async def run_forever(self, max_windows: Optional[int] = None) -> RunStats:
@@ -154,7 +198,11 @@ class Engine:
 
         await self.backend.start(market)
         pull_at = market.end_ts - cfg.pull_before_end_s
+        hedge_at = (market.end_ts - self.fvc.hedge_before_end_s
+                    if self.fvc else None)
         peak_quotes = 0
+        toxicity = ToxicityMonitor(self.fvc.toxicity_fills,
+                                   self.fvc.toxicity_pause_s) if self.fvc else None
 
         # ---------------- quoting loop ----------------
         while True:
@@ -168,18 +216,41 @@ class Engine:
                     await self.backend.on_books(books[0], books[1])
                     for fill in await self.backend.poll_fills():
                         ledger.apply(fill)
+                        if toxicity is not None:
+                            toxicity.on_fill(fill.label, now)
                         log.info(
                             "[%s #%d] FILL %s %.2f x %.0f",
                             cfg.asset, market.window_ts, fill.label,
                             fill.price, fill.shares,
                         )
                     # 2) cancel + repost the ladder
-                    quotes = build_ladder(
-                        market, books[0], books[1], cfg,
-                        spent=ledger.spent,
-                        up_shares=ledger.up.shares,
-                        down_shares=ledger.down.shares,
-                    )
+                    if self.fvc is not None and self.fv_feed is not None:
+                        fv = self.fv_feed.fair_value(market, now)
+                        ledger._toxicity = toxicity
+                        quotes = build_fv_ladder(
+                            market, books[0], books[1], cfg, self.fvc, fv,
+                            ledger, now,
+                        )
+                    else:
+                        quotes = build_ladder(
+                            market, books[0], books[1], cfg,
+                            spent=ledger.spent,
+                            up_shares=ledger.up.shares,
+                            down_shares=ledger.down.shares,
+                        )
+                    # 2b) endgame hedge: aggressive buys of the opposite side
+                    if (self.fvc is not None and self.fvc.endgame_hedge
+                            and hedge_at is not None and now >= hedge_at):
+                        hedges = endgame_hedge(market, ledger, self.fvc, now,
+                                               books)
+                        if hedges:
+                            log.info(
+                                "[%s #%d] endgame hedge: %s",
+                                cfg.asset, market.window_ts,
+                                [(h.label, round(h.price, 2), round(h.size, 1))
+                                 for h in hedges],
+                            )
+                            quotes = quotes + hedges
                     await self.backend.cancel_market()
                     await self.backend.place(quotes)
                     peak_quotes = max(peak_quotes, len(quotes))
